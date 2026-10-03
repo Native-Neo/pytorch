@@ -28,7 +28,9 @@ from torch.testing._internal.common_distributed import (
     skip_if_lt_x_gpu,
 )
 from torch.testing._internal.common_utils import (  # type: ignore[attr-defined]
+    instantiate_parametrized_tests,
     IS_LINUX,
+    parametrize,
     run_tests,
     TEST_WITH_TORCHINDUCTOR,
     TestCase,
@@ -953,6 +955,64 @@ def find_buffer_assignments(code):
     return tuple(f"buf{match.group(1)}" for match in matches)
 
 
+@instantiate_parametrized_tests
+class CollectiveReinplaceTestCPU(TestCase):
+    def setUp(self):
+        super().setUp()
+        dummy_init_pg()
+
+    def tearDown(self):
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        torch._dynamo.reset()
+        super().tearDown()
+
+    @fresh_cache()
+    @parametrize("collective", ("single", "coalesced"))
+    @parametrize("collective_first", (False, True))
+    def test_scatter_collective_result_does_not_alias_input(
+        self, collective, collective_first
+    ):
+        def reduce(tensor):
+            if collective == "single":
+                reduced = torch.ops._c10d_functional.all_reduce.default(
+                    tensor, "sum", "0"
+                )
+                return torch.ops._c10d_functional.wait_tensor.default(reduced)
+
+            reduced = torch.ops._c10d_functional.all_reduce_coalesced.default(
+                [tensor], "sum", "0"
+            )
+            return torch.ops._c10d_functional.wait_tensors.default(reduced)[0]
+
+        def fn(x, diag):
+            if collective_first:
+                reduced = reduce(x)
+                updated = torch.diagonal_scatter(reduced, diag)
+            else:
+                updated = torch.diagonal_scatter(x, diag)
+                updated = reduce(updated)
+            x.copy_(updated)
+            return updated
+
+        def run(callable_):
+            x = torch.arange(16.0).reshape(4, 4)
+            diag = torch.full((4,), -1.0)
+            out = callable_(x, diag)
+            x_after_call = x.clone()
+            out_after_call = out.clone()
+            self.assertNotEqual(
+                out.untyped_storage().data_ptr(), x.untyped_storage().data_ptr()
+            )
+            out.add_(100)
+            self.assertEqual(x, x_after_call)
+            return x_after_call, out_after_call
+
+        eager = run(fn)
+        compiled = run(torch.compile(fn, fullgraph=True))
+        self.assertEqual(compiled, eager)
+
+
 class CompileTestCPU(TestCase):
     def setUp(self):
         super().setUp()
@@ -999,9 +1059,8 @@ class CompileTestCPU(TestCase):
             for op in include_ops:
                 self.assertIn(op, code)
 
-        # AOTI uses the same configuration for both wrapper variants.
-        if not cpp_wrapper:
-            AOTIRunnerUtil.run(func, (arg,))
+        # Test aoti
+        AOTIRunnerUtil.run(func, (arg,))
         torch.cpu.synchronize()
 
     def test_inductor_all_reduce_cpu(self):
@@ -1219,7 +1278,6 @@ class CompileTest(TestCase):
         compiled = torch.compile(func)
         code = run_and_get_triton_code(compiled, arg)
         buf0, buf1 = find_buffer_assignments(code)
-        (reused_buf,) = re.findall(rf"(buf\d+) = {buf0}; del {buf0}  # reuse", code)
         (
             FileCheck()
             # Expect allocation
@@ -1230,10 +1288,10 @@ class CompileTest(TestCase):
             .check(f"{buf1} = empty")
             .check(f"extern_kernels.mm(arg0_1, {buf0}, out={buf1}")
             # Expect {buf0} to be reused
-            .check(f"{reused_buf} = {buf0}; del {buf0}  # reuse")
-            .check(f"extern_kernels.mm(arg0_1, {buf1}, out={reused_buf}")
+            .check(f"buf8 = {buf0}; del {buf0}  # reuse")
+            .check(f"extern_kernels.mm(arg0_1, {buf1}, out=buf8")
             # Expect no extra copy on return
-            .check(f"return ({buf1}, {reused_buf}, )")
+            .check(f"return ({buf1}, buf8, )")
             .run(code)
         )
         if "= torch.ops._c10d_functional.wait_tensor.default" in code:
