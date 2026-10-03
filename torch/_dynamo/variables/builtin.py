@@ -589,6 +589,31 @@ _VALUE_INDEPENDENT_INSTANCECHECKS = frozenset(
 )
 
 
+# Instances of these types cannot carry per-instance attributes, so whether an
+# attribute based __instancecheck__ (a runtime_checkable Protocol with data
+# members) matches is fixed by the type alone. Dynamo often has no wrapped object
+# for them -- a symbolic scalar, a container built while tracing -- and can still
+# answer with a representative value. Exact types only: a subclass may add a
+# __dict__ or a __getattr__, and classes themselves always have one.
+_VALUE_INDEPENDENT_TYPES = frozenset(
+    {
+        int,
+        float,
+        bool,
+        complex,
+        str,
+        bytes,
+        bytearray,
+        list,
+        tuple,
+        dict,
+        set,
+        frozenset,
+        type(None),
+    }
+)
+
+
 def _uses_custom_classinfo_check(
     type_info: Any,
     *,
@@ -2800,11 +2825,11 @@ class BuiltinVariable(BaseBuiltinVariable):
 
         # Mirror CPython's object_recursive_isinstance: nested tuples and
         # unions are flattened, and members are validated and checked left to
-        # right, stopping at the first match. A member whose metaclass supplies
-        # __instancecheck__ (Protocols, ABCs, typing aliases, ...) is evaluated
-        # with the real isinstance() whenever Dynamo has the object. Only that
-        # branch reads the object, so a lazy constant stays unrealized -- and
-        # keeps its weaker type-only guard -- until such a member is reached.
+        # right, stopping at the first match. A member whose metaclass defines
+        # __instancecheck__ (Protocols, ABCs, ...) is evaluated with the real
+        # isinstance() on the wrapped Python object. Only that branch reads
+        # arg.value, so a lazy constant stays unrealized -- and keeps its
+        # weaker type-only guard -- until such a member is actually reached.
         pending: list[Any] = [isinstance_type]
         while pending:
             member = pending.pop()
@@ -2826,33 +2851,15 @@ class BuiltinVariable(BaseBuiltinVariable):
                         "isinstance() arg 2 must be a type, a tuple of types, or a union"
                     ],
                 )
-            # Like CPython's _PyObject_LookupSpecial, resolve the hook through
-            # the metaclass MRO: an inherited __instancecheck__ (a typing alias,
-            # a metaclass deriving from ABCMeta) hooks the check just as much as
-            # one defined directly. For a plain class this yields
-            # type.__instancecheck__, whose answer is issubclass() below.
-            instancecheck = getattr(type(member), "__instancecheck__", None)
-            # A class based hook reads only type(obj), so issubclass() is exact
-            # and a lazy constant keeps its weaker TYPE_MATCH guard. For the
-            # exact builtins in _VALUE_INDEPENDENT_TYPES an attribute based hook
-            # cannot see per-instance state either, and they cannot spoof
-            # __class__ -- the one thing ABCMeta's hook sees that issubclass()
-            # does not. Everything else needs the object itself.
-            answered_by_type = instancecheck is type.__instancecheck__ or (
-                arg_type in _VALUE_INDEPENDENT_TYPES
-                and (
-                    instancecheck is abc.ABCMeta.__instancecheck__
-                    or instancecheck in _VALUE_INDEPENDENT_INSTANCECHECKS
-                )
-            )
-            value = (
-                NO_SUCH_SUBOBJ
-                if answered_by_type
-                else arg.get_real_python_backed_value()
-            )
-            if value is not NO_SUCH_SUBOBJ:
+            # type.__dict__ holds __instancecheck__ itself, so plain classes
+            # must be excluded: their answer comes from issubclass() below.
+            metaclass = type(member)
+            hooked = metaclass is not type and "__instancecheck__" in metaclass.__dict__
+            if hooked and isinstance(
+                arg, (variables.UserDefinedObjectVariable, variables.ConstantVariable)
+            ):
                 try:
-                    val = isinstance(value, member)
+                    val = isinstance(arg.value, member)
                 except TypeError as e:
                     raise_observed_exception(TypeError, tx, args=list(e.args))
             else:
@@ -2868,10 +2875,7 @@ class BuiltinVariable(BaseBuiltinVariable):
                 except TypeError as e:
                     # issubclass() rejecting the classinfo (e.g. a runtime_checkable
                     # Protocol with data members) says nothing about isinstance().
-                    if not (
-                        arg_type in _VALUE_INDEPENDENT_TYPES
-                        and instancecheck in _VALUE_INDEPENDENT_INSTANCECHECKS
-                    ):
+                    if arg_type not in _VALUE_INDEPENDENT_TYPES:
                         unimplemented(
                             gb_type="builtin isinstance() with classinfo that does not support issubclass()",
                             context=f"isinstance({arg}, {isinstance_type})",
@@ -2889,6 +2893,7 @@ class BuiltinVariable(BaseBuiltinVariable):
             if val:
                 return VariableTracker.build(tx, True)
         return VariableTracker.build(tx, False)
+
 
     def call_issubclass(
         self,
